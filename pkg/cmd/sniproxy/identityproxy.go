@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -19,10 +20,15 @@ import (
 )
 
 type IdentityProxyOptions struct {
+	ListenAddr string
+	TargetPort uint16
 }
 
 func NewIdentityProxyOptions(streams genericclioptions.IOStreams) *IdentityProxyOptions {
-	return &IdentityProxyOptions{}
+	return &IdentityProxyOptions{
+		ListenAddr: ":5000",
+		TargetPort: 443,
+	}
 }
 
 func NewIdentityProxyCmd(streams genericclioptions.IOStreams) *cobra.Command {
@@ -55,6 +61,9 @@ func NewIdentityProxyCmd(streams genericclioptions.IOStreams) *cobra.Command {
 		SilenceUsage:  true,
 	}
 
+	cmd.Flags().StringVarP(&o.ListenAddr, "listen", "", o.ListenAddr, "Address to listen on.")
+	cmd.Flags().Uint16VarP(&o.TargetPort, "target-port", "", o.TargetPort, "Destination port for connecting to the backend.")
+
 	return cmd
 }
 
@@ -80,7 +89,7 @@ func (o *IdentityProxyOptions) Run(streams genericclioptions.IOStreams, cmd *cob
 		cancel()
 	}()
 
-	l, err := net.Listen("tcp", ":5001")
+	l, err := net.Listen("tcp", o.ListenAddr)
 	if err != nil {
 		klog.Fatal(err)
 	}
@@ -89,7 +98,8 @@ func (o *IdentityProxyOptions) Run(streams genericclioptions.IOStreams, cmd *cob
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			klog.InfoS("Closing listener")
+			return l.Close()
 
 		default:
 			conn, err := l.Accept()
@@ -98,7 +108,7 @@ func (o *IdentityProxyOptions) Run(streams genericclioptions.IOStreams, cmd *cob
 				continue
 			}
 
-			go handleConnection(conn)
+			go handleConnection(conn, o.TargetPort)
 		}
 	}
 }
@@ -134,16 +144,16 @@ func readClientHello(reader io.Reader) (*tls.ClientHelloInfo, error) {
 	return hello, nil
 }
 
-func peekClientHello(reader io.Reader) (*tls.ClientHelloInfo, io.Reader, error) {
-	peekedBytes := new(bytes.Buffer)
-	hello, err := readClientHello(io.TeeReader(reader, peekedBytes))
-	if err != nil {
-		return nil, nil, err
-	}
-	return hello, io.MultiReader(peekedBytes, reader), nil
-}
+// func peekClientHello(reader io.Reader) (*tls.ClientHelloInfo, io.Reader, error) {
+// 	peekedBytes := new(bytes.Buffer)
+// 	hello, err := readClientHello(io.TeeReader(reader, peekedBytes))
+// 	if err != nil {
+// 		return nil, nil, err
+// 	}
+// 	return hello, io.MultiReader(peekedBytes, reader), nil
+// }
 
-func handleConnection(clientConn net.Conn) {
+func handleConnection(clientConn net.Conn, targetPort uint16) {
 	defer clientConn.Close()
 
 	err := clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -152,9 +162,10 @@ func handleConnection(clientConn net.Conn) {
 		return
 	}
 
-	clientHello, clientReader, err := peekClientHello(clientConn)
+	peekedBytes := bytes.Buffer{}
+	clientHello, err := readClientHello(io.TeeReader(clientConn, &peekedBytes))
 	if err != nil {
-		klog.ErrorS(err, "Can't peak at ClientHello")
+		klog.ErrorS(err, "Can't read ClientHello")
 		return
 	}
 
@@ -163,7 +174,7 @@ func handleConnection(clientConn net.Conn) {
 		return
 	}
 
-	backendConn, err := net.DialTimeout("tcp", net.JoinHostPort(clientHello.ServerName, "443"), 5*time.Second)
+	backendConn, err := net.DialTimeout("tcp", net.JoinHostPort(clientHello.ServerName, strconv.FormatUint(uint64(targetPort), 10)), 5*time.Second)
 	if err != nil {
 		klog.ErrorS(err, "Can't dial backend")
 		return
@@ -173,16 +184,23 @@ func handleConnection(clientConn net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	// const bufferSize int = 64 * 1024 * 1024
+
 	go func() {
-		buffer := make([]byte, 64*1024*1024)
-		io.CopyBuffer(clientConn, backendConn, buffer)
-		clientConn.(*net.TCPConn).CloseWrite()
+		// buffer := make([]byte, bufferSize)
+		// io.CopyBuffer(backendConn, &peekedBytes, buffer)
+		// io.CopyBuffer(backendConn, clientConn, buffer)
+		io.Copy(backendConn, &peekedBytes)
+		io.Copy(backendConn, clientConn)
+		backendConn.(*net.TCPConn).CloseWrite()
 		wg.Done()
 	}()
+
 	go func() {
-		buffer := make([]byte, 64*1024*1024)
-		io.CopyBuffer(backendConn, clientReader, buffer)
-		backendConn.(*net.TCPConn).CloseWrite()
+		// buffer := make([]byte, bufferSize)
+		// io.CopyBuffer(clientConn, backendConn, buffer)
+		io.Copy(clientConn, backendConn)
+		clientConn.(*net.TCPConn).CloseWrite()
 		wg.Done()
 	}()
 
